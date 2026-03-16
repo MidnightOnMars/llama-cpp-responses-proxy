@@ -1,0 +1,11 @@
+{
+  "name": "llama-cpp-responses-proxy",
+  "version": "1.0.0",
+  "description": "SSE fix proxy for llama.cpp's /v1/responses endpoint — adds fields required by the Vercel AI SDK",
+  "main": "proxy.mjs",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "node proxy.mjs"
+  }
+}
