@@ -1,171 +1,151 @@
 # Responses API SSE Compatibility Investigation
 
-Detailed findings from investigating why tool calls silently fail when using `@ai-sdk/openai` with llama.cpp's `/v1/responses` streaming endpoint.
+Detailed findings from investigating why tool calls fail when using llama.cpp's `/v1/responses` streaming endpoint with strict OpenAI Responses clients such as `@ai-sdk/openai`.
 
-## 1. What works and what doesn't
+## 1. Current status
 
-### Direct API (curl) — everything works
+As of March 16, 2026:
+
+- llama.cpp issue [#20607](https://github.com/ggml-org/llama.cpp/issues/20607) is still open
+- llama.cpp still omits `output_index` on streamed function-call events and omits `id` on streamed `function_call` items
+- `@ai-sdk/openai` still routes generic OpenAI models through the Responses API
+- the mismatch is still reproducible with current packages
+
+Validated against:
+
+- `@ai-sdk/openai` `3.0.41`
+- `ai` `6.0.116`
+
+## 2. What works and what does not
+
+At the llama.cpp API level, tool calling itself works:
 
 | Endpoint | Streaming | Tools | Result |
 |---|---|---|---|
-| `/v1/chat/completions` | No | Yes | `finish_reason: "tool_calls"`, correct function call |
-| `/v1/chat/completions` | Yes | Yes | Works (standard SSE delta format) |
-| `/v1/responses` | No | Yes | `type: "function_call"` in output array, correct args |
-| `/v1/responses` | Yes | Yes | Proper SSE: `response.function_call_arguments.delta` events |
+| `/v1/chat/completions` | No | Yes | works |
+| `/v1/chat/completions` | Yes | Yes | works |
+| `/v1/responses` | No | Yes | works |
+| `/v1/responses` | Yes | Yes | model emits tool-call SSE correctly enough for humans and simple clients |
 
-llama.cpp handles both APIs correctly at the protocol level. The model produces structured tool calls reliably across both endpoints.
+The break happens in strict Responses clients that validate stream chunks against OpenAI-style schemas.
 
-### Through @ai-sdk/openai — tool calls silently fail
+| Client path | Result |
+|---|---|
+| `@ai-sdk/openai-compatible` -> Chat Completions | tool calls work |
+| `@ai-sdk/openai` -> Responses API | tool calls are ignored unless the missing fields are patched |
 
-| Adapter | API path | Result |
-|---|---|---|
-| `@ai-sdk/openai-compatible` | Chat Completions | Tool calls work |
-| `@ai-sdk/openai` | Responses API | `finishReason: "stop"`, no tool execution |
+## 3. Root cause
 
-`@ai-sdk/openai` always routes to the Responses API (via `createResponsesModel()`). There is no config option to change this. The SDK's Zod schema validation rejects llama.cpp's streaming events due to missing required fields.
-
-## 2. Root cause
-
-The AI SDK validates every streaming SSE event against a Zod discriminated union schema. Three categories of missing fields cause validation failures:
+The current `@ai-sdk/openai` Responses stream parser still expects:
 
 ### Missing `output_index`
 
-`response.output_item.added`, `response.output_item.done`, and `response.function_call_arguments.delta` all require an `output_index` field (number). llama.cpp omits it. Without it, events fail validation and `chunk.success` is false — the handler skips them with `return`.
+Required on:
 
-### Missing `id` on function_call items
+- `response.output_item.added`
+- `response.output_item.done`
+- `response.function_call_arguments.delta`
 
-The SDK schema requires both `id` (string) and `call_id` (string) on function_call items inside `response.output_item.added` and `response.output_item.done`. llama.cpp only sends `call_id`. This causes the inner discriminated union to fail even when `output_index` is present.
+llama.cpp does not emit it on those events today.
 
-### Missing `created_at` and `model` on response.created
+### Missing `id` on `function_call` items
 
-The schema requires `response.{id, created_at, model}` but llama.cpp only sends `response.{id, status}`.
+For streamed `function_call` items, the SDK expects both:
 
-### The critical consequence
+- `id`
+- `call_id`
 
-When `response.output_item.done` for a `function_call` item fails validation, the handler never sets `hasFunctionCall = true`. So `finishReason` is always `"stop"` instead of `"tool-calls"`. The client never executes tool calls. No error is surfaced.
+llama.cpp emits only `call_id`.
 
-## 3. SSE field comparison: AI SDK expected vs llama.cpp actual
+### Missing `created_at` and `model` on `response.created`
 
-### response.created
+The SDK expects `response.{id, created_at, model}` on the created event.
+llama.cpp currently emits only `response.{id, status}` there.
 
-| Field | AI SDK expects | llama.cpp sends |
-|---|---|---|
-| `response.id` | Required (string) | Present |
-| `response.created_at` | **Required** (number) | **Missing** |
-| `response.model` | **Required** (string) | **Missing** |
+## 4. Why tool execution never starts
 
-### response.output_item.added / .done
+The important failure is on streamed function-call items:
 
-| Field | AI SDK expects | llama.cpp sends |
-|---|---|---|
-| `type` | Required (string) | Present |
-| `output_index` | **Required** (number) | **Missing** |
-| `item` | Required (object) | Present |
-| `item.id` (for function_call) | **Required** (string) | **Missing** (only `call_id` sent) |
-| `item.call_id` (for function_call) | Required (string) | Present |
+1. `response.output_item.added` and `response.output_item.done` for `function_call` do not match the expected schema
+2. the parser treats them as unknown chunks
+3. `hasFunctionCall` is never set
+4. `finishReason` resolves to `"stop"` instead of `"tool-calls"`
+5. downstream tool execution never starts
 
-### response.function_call_arguments.delta
+In an end-to-end repro with current `@ai-sdk/openai`, the unpatched stream finishes with:
 
-| Field | AI SDK expects | llama.cpp sends |
-|---|---|---|
-| `item_id` | Required (string) | Present |
-| `output_index` | **Required** (number) | **Missing** |
-| `delta` | Required (string) | Present |
+- no tool-call parts
+- empty step content
+- `finishReason: "stop"`
 
-### response.output_text.delta
+The same stream through this proxy produces:
 
-| Field | AI SDK expects | llama.cpp sends |
-|---|---|---|
-| `item_id` | Required (string) | Present |
-| `output_index` | **Required** (number) | **Missing** |
-| `content_index` | **Required** (number) | **Missing** |
-| `delta` | Required (string) | Present |
+- `tool-input-start`
+- `tool-input-delta`
+- `tool-call`
+- `finishReason: "tool-calls"`
 
-### response.content_part.added
+## 5. Important nuance about other chunk types
 
-| Field | AI SDK expects | llama.cpp sends |
-|---|---|---|
-| `item_id` | Required (string) | Present |
-| `output_index` | **Required** (number) | **Missing** |
-| `content_index` | **Required** (number) | **Missing** |
-| `part` | **Required** (object) | **Missing** |
+Not every llama.cpp/OpenAI mismatch matters.
 
-### Error events
+As of the current AI SDK:
 
-| Field | AI SDK expects | llama.cpp sends |
-|---|---|---|
-| `sequence_number` | **Required** (number) | **Missing** |
-| `error.code` | **Required** (string) | Number (e.g., `500`) |
+- `response.content_part.added`
+- `response.content_part.done`
+- `response.output_text.done`
+- `response.reasoning_text.delta`
+- `response.in_progress`
 
-## 4. Catch-all behavior
+are tolerated as unknown chunks or otherwise non-critical for this specific failure.
 
-The SDK schema has a catch-all at the end:
+That is why the proxy only patches the function-call-critical fields plus `response.created`.
 
-```js
-object({ type: string }).transform(v => ({ type: "unknown_chunk", message: v.type }))
-```
+## 6. Why `@ai-sdk/openai` still hits this path
 
-Unknown event types like `response.reasoning_text.delta`, `response.in_progress`, `response.content_part.added/done`, and `response.output_text.done` are silently transformed to `unknown_chunk` and ignored. They do **not** crash the parser.
+The current OpenAI provider still routes its generic language-model constructor through Responses:
 
-The actual `AI_TypeValidationError` only occurs when an event completely fails to match **any** variant including the catch-all — for example, error objects that lack a `type` field entirely.
-
-## 5. Why @ai-sdk/openai always uses the Responses API
-
-The `@ai-sdk/openai` provider's `createLanguageModel()` unconditionally calls `createResponsesModel()`:
-
-```js
+```ts
 const createLanguageModel = (modelId) => {
-    return createResponsesModel(modelId);
+  return createResponsesModel(modelId);
 };
 ```
 
-Clients that use custom providers (not built-in ones like "openai" or "azure") always fall through to `sdk.languageModel()` → Responses API. There is no config option to change this routing.
+So if a client uses `@ai-sdk/openai` for a custom/local provider, it still ends up on `/v1/responses`.
 
-The `"compatibility": "compatible"` constructor option does **not** affect Responses API streaming event validation — it only affects Chat Completions response parsing.
+## 7. Best workaround vs best long-term fix
 
-## 6. Common configuration mistakes
+### Best workaround when you control the client
 
-### `"tools": true` (wrong field)
+Prefer Chat Completions:
 
-Not a valid model config field. The correct field is `"tool_call": true`. The `tools` field happened to work with `@ai-sdk/openai-compatible` because that adapter uses Chat Completions, where tool support is wired differently.
+- use `@ai-sdk/openai-compatible`
+- point it at `/v1/chat/completions`
 
-### `"api": "chat"` (not a mode selector)
+That is simpler and lower-maintenance than a proxy.
 
-The `api` field at the provider level is a URL string (equivalent to `baseURL`), not a mode switch. Setting it to `"chat"` causes the client to use `"chat"` as a URL.
+### Best workaround when the client forces Responses
 
-### Missing reasoning config
+Use this proxy.
 
-Models that output reasoning tokens need:
+It is not a hack in the sense of changing the model output or inventing a new protocol. It is a narrow compatibility shim that fills fields the client already expects from an OpenAI-style Responses stream.
 
-```json
-{
-  "reasoning": true,
-  "interleaved": {
-    "field": "reasoning_content"
-  }
-}
-```
+### Best long-term fix
 
-Without this, the client doesn't know how to parse reasoning output items.
+Fix llama.cpp upstream so the Responses SSE emitter includes:
 
-## 7. What the proxy fixes
+1. `output_index` on streamed output-item and function-call-argument events
+2. `id` on streamed `function_call` items
+3. `created_at` and `model` on `response.created`
 
-The proxy (`proxy.mjs`) patches only the fields that matter:
+## 8. Recommended upstream change set
 
-1. **Adds `output_index`** — sequential counter to `response.output_item.added`, `.done`, and `response.function_call_arguments.delta`
-2. **Adds `id` to function_call items** — copies `call_id` to `id` when missing
-3. **Adds `created_at` and `model` to `response.created`** — extracts model from request body
-4. **Patches `response.completed` output array** — adds `id` to function_call items
-5. **Fixes error events** — converts `error.code` from number to string, adds `sequence_number`
+Minimal upstream fix:
 
-All other events pass through unchanged and hit the SDK's catch-all → `unknown_chunk` → silently ignored.
+1. add `output_index` to `response.output_item.added`
+2. add `output_index` to `response.output_item.done`
+3. add `output_index` to `response.function_call_arguments.delta`
+4. include `id` on streamed `function_call` items
+5. include `created_at` and `model` on `response.created`
 
-## 8. Recommended upstream fix
-
-The fix in llama.cpp's Responses API streaming implementation is minimal — three changes to the event emitter:
-
-1. Add `output_index` (sequential counter starting at 0) to `response.output_item.added`, `response.output_item.done`, and `response.function_call_arguments.delta` events
-2. Add `id` field to function_call items in output (can be same value as `call_id`)
-3. Add `created_at` (unix timestamp) and `model` fields to the `response.created` event's response object
-
-No changes needed for reasoning events, content_part events, or other event types — the AI SDK's catch-all handles them gracefully.
+Nothing more is required to resolve the tool-calling failure reproduced here.
