@@ -8,6 +8,9 @@
 //   1. output_index on output_item.added/.done and function_call_arguments.delta
 //   2. id on function_call items (SDK requires both id and call_id)
 //   3. created_at and model on response.created
+// Request bodies patched:
+//   4. strips prior reasoning items from /v1/responses continuation input
+//      because llama.cpp rejects OpenCode follow-up requests that include them
 //
 // See: https://github.com/ggml-org/llama.cpp/issues/20607
 
@@ -27,6 +30,87 @@ export function createPatchState(requestModel = 'unknown') {
   };
 }
 
+function isResponsesPath(pathname = '') {
+  return pathname === '/v1/responses' || pathname.endsWith('/v1/responses');
+}
+
+function isReasoningInputItem(item) {
+  return !!item && typeof item === 'object' && !Array.isArray(item) && item.type === 'reasoning';
+}
+
+function normalizeAssistantContent(content) {
+  if (typeof content === 'string') {
+    return [{ type: 'output_text', text: content }];
+  }
+  if (!Array.isArray(content)) {
+    return content;
+  }
+
+  return content.map((part) => {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) {
+      return part;
+    }
+    if (part.type === 'input_text') {
+      return {
+        ...part,
+        type: 'output_text',
+      };
+    }
+    return part;
+  });
+}
+
+function normalizeResponsesInputItem(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    return item;
+  }
+  if (item.role !== 'assistant' || item.type) {
+    return item;
+  }
+
+  return {
+    ...item,
+    type: 'message',
+    content: normalizeAssistantContent(item.content),
+  };
+}
+
+export function patchRequestBody(body, pathname = '') {
+  if (!isResponsesPath(pathname)) {
+    return body;
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return body;
+  }
+  if (!Array.isArray(body.input)) {
+    return body;
+  }
+
+  let changed = false;
+  const normalizedInput = [];
+  for (const item of body.input) {
+    if (isReasoningInputItem(item)) {
+      changed = true;
+      continue;
+    }
+
+    const normalizedItem = normalizeResponsesInputItem(item);
+    if (normalizedItem !== item) {
+      changed = true;
+    }
+    normalizedInput.push(normalizedItem);
+  }
+
+  if (!changed) {
+    return body;
+  }
+
+  return {
+    ...body,
+    input: normalizedInput,
+  };
+}
+
 function getFunctionCallId(item, fallback) {
   return item.id || item.call_id || fallback;
 }
@@ -36,6 +120,10 @@ function getItemKey(item) {
 }
 
 export function patchEventData(data, state) {
+  if (!data.type && data.error && typeof data.error === 'object') {
+    data.type = 'error';
+  }
+
   const type = data.type || '';
 
   if (type === 'response.created') {
@@ -175,10 +263,14 @@ export function createProxyServer({
     clientReq.on('data', (chunk) => bodyChunks.push(chunk));
     clientReq.on('end', () => {
       const body = Buffer.concat(bodyChunks);
+      let proxyBody = body;
       let requestModel = 'unknown';
 
       try {
-        requestModel = JSON.parse(body.toString()).model || requestModel;
+        const parsedBody = JSON.parse(body.toString());
+        const patchedBody = patchRequestBody(parsedBody, url.pathname);
+        requestModel = patchedBody.model || requestModel;
+        proxyBody = Buffer.from(JSON.stringify(patchedBody));
       } catch {
         // Non-JSON requests are forwarded unchanged.
       }
@@ -188,7 +280,7 @@ export function createProxyServer({
         headers: {
           ...clientReq.headers,
           host: url.host,
-          'content-length': body.length,
+          'content-length': proxyBody.length,
         },
         timeout: 180000,
       }, (proxyRes) => {
@@ -247,7 +339,7 @@ export function createProxyServer({
         clientRes.end(JSON.stringify({ error: error.message }));
       });
 
-      proxyReq.end(body);
+      proxyReq.end(proxyBody);
     });
   });
 

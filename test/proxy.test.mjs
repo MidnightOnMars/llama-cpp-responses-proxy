@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   createPatchState,
   patchEventData,
+  patchRequestBody,
   patchSseBlock,
 } from '../proxy.mjs';
 
@@ -93,4 +94,112 @@ test('patchSseBlock preserves non-data lines and handles CRLF blocks', () => {
 test('patchSseBlock passes through non-JSON data lines', () => {
   const state = createPatchState();
   assert.equal(patchSseBlock('data: [DONE]', state), 'data: [DONE]');
+});
+
+test('patchRequestBody strips reasoning items and normalizes assistant messages', () => {
+  const body = {
+    model: 'gpt-oss-120b',
+    input: [
+      { role: 'developer', content: 'You are opencode.' },
+      { role: 'user', content: [{ type: 'input_text', text: 'Create hello.py' }] },
+      { type: 'reasoning', id: 'rs1', summary: [], encrypted_content: '' },
+      {
+        role: 'assistant',
+        id: 'msg1',
+        content: [{ type: 'output_text', text: 'I will write the file.' }],
+      },
+      {
+        type: 'function_call',
+        id: 'fc1',
+        call_id: 'fc1',
+        name: 'glob',
+        arguments: '{"pattern":"hello.py"}',
+      },
+      { type: 'function_call_output', call_id: 'fc1', output: 'No files found' },
+    ],
+  };
+
+  const result = patchRequestBody(body, '/v1/responses');
+
+  assert.notStrictEqual(result, body);
+  assert.deepStrictEqual(result.input, [
+    { role: 'developer', content: 'You are opencode.' },
+    { role: 'user', content: [{ type: 'input_text', text: 'Create hello.py' }] },
+    {
+      role: 'assistant',
+      type: 'message',
+      id: 'msg1',
+      content: [{ type: 'output_text', text: 'I will write the file.' }],
+    },
+    {
+      type: 'function_call',
+      id: 'fc1',
+      call_id: 'fc1',
+      name: 'glob',
+      arguments: '{"pattern":"hello.py"}',
+    },
+    { type: 'function_call_output', call_id: 'fc1', output: 'No files found' },
+  ]);
+});
+
+test('patchRequestBody leaves non-responses requests unchanged', () => {
+  const body = {
+    model: 'gpt-oss-120b',
+    input: [{ type: 'reasoning', id: 'rs1' }],
+  };
+
+  const result = patchRequestBody(body, '/v1/chat/completions');
+
+  assert.strictEqual(result, body);
+});
+
+test('patchRequestBody leaves responses requests unchanged when no reasoning items exist', () => {
+  const body = {
+    model: 'gpt-oss-120b',
+    input: [{ role: 'developer', content: 'You are opencode.' }],
+  };
+
+  const result = patchRequestBody(body, '/v1/responses');
+
+  assert.strictEqual(result, body);
+});
+
+test('patchRequestBody converts assistant string content to output_text messages', () => {
+  const body = {
+    model: 'gpt-oss-120b',
+    input: [
+      { role: 'assistant', content: 'Done.', id: 'msg2' },
+    ],
+  };
+
+  const result = patchRequestBody(body, '/v1/responses');
+
+  assert.deepStrictEqual(result.input, [
+    {
+      role: 'assistant',
+      type: 'message',
+      id: 'msg2',
+      content: [{ type: 'output_text', text: 'Done.' }],
+    },
+  ]);
+});
+
+test('patchEventData normalizes bare error objects', () => {
+  const result = patchEventData({
+    error: {
+      code: 500,
+      message: 'boom',
+      type: 'server_error',
+    },
+  }, createPatchState('gpt-oss-120b'));
+
+  assert.deepStrictEqual(result, {
+    type: 'error',
+    sequence_number: 0,
+    error: {
+      code: '500',
+      message: 'boom',
+      type: 'server_error',
+    },
+  });
 });

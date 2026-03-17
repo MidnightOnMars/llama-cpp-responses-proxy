@@ -31,7 +31,7 @@ The break happens in strict Responses clients that validate stream chunks agains
 
 | Client path | Result |
 |---|---|
-| `@ai-sdk/openai-compatible` -> Chat Completions | tool calls work |
+| `@ai-sdk/openai-compatible` -> Chat Completions | tool calls work in some clients, but zero `tool_use` events observed through OpenCode (27 consecutive failures) |
 | `@ai-sdk/openai` -> Responses API | tool calls are ignored unless the missing fields are patched |
 
 ## 3. Root cause
@@ -115,20 +115,17 @@ So if a client uses `@ai-sdk/openai` for a custom/local provider, it still ends 
 
 ## 7. Best workaround vs best long-term fix
 
-### Best workaround when you control the client
+### Chat Completions is not universally reliable
 
-Prefer Chat Completions:
+The original recommendation was to prefer `@ai-sdk/openai-compatible` targeting Chat Completions. In practice, **this does not work for OpenCode with llama.cpp.** Production testing showed zero `tool_use` events across 27 consecutive attempts using the Chat Completions path through OpenCode.
 
-- use `@ai-sdk/openai-compatible`
-- point it at `/v1/chat/completions`
+The Chat Completions path may work for other clients that do not rely on the Vercel AI SDK's Responses integration, but it cannot be recommended as a general workaround.
 
-That is simpler and lower-maintenance than a proxy.
+### Best workaround: use this proxy
 
-### Best workaround when the client forces Responses
+Use this proxy with `@ai-sdk/openai` targeting the Responses API. This is the only validated path for OpenCode with llama.cpp.
 
-Use this proxy.
-
-It is not a hack in the sense of changing the model output or inventing a new protocol. It is a narrow compatibility shim that fills fields the client already expects from an OpenAI-style Responses stream.
+It is not a hack in the sense of changing the model output or inventing a new protocol. It is a narrow compatibility shim that fills fields the client already expects from an OpenAI-style Responses stream, and normalizes request bodies to remove items llama.cpp does not understand.
 
 ### Best long-term fix
 
@@ -149,3 +146,25 @@ Minimal upstream fix:
 5. include `created_at` and `model` on `response.created`
 
 Nothing more is required to resolve the tool-calling failure reproduced here.
+
+## 9. Multi-turn continuation failure and request normalization
+
+### The problem
+
+Even after the SSE response patching enables the first tool call, multi-turn conversations fail on the **second** request. After a successful tool call, clients like OpenCode send a follow-up `/v1/responses` request that includes the full conversation history. This history contains:
+
+1. **`reasoning` items** — prior reasoning traces that llama.cpp does not understand
+2. **Malformed assistant messages** — missing `type: "message"`, string `content` instead of array, `input_text` parts instead of `output_text`
+
+llama.cpp rejects these with `400 item['content'] is not an array`.
+
+### The fix
+
+The proxy now normalizes request bodies before forwarding them to llama.cpp:
+
+- Strips items where `type === 'reasoning'` from the `input` array
+- Adds `type: "message"` to assistant messages that lack it
+- Converts string `content` to `[{type: "output_text", text: ...}]`
+- Converts `input_text` parts to `output_text` parts
+
+This normalization only applies to `/v1/responses` requests. Chat Completions and other endpoints pass through unchanged. If no modifications are needed, the original body is forwarded unchanged (referential equality is preserved).
